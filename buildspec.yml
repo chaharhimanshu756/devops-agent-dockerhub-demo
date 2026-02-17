@@ -4,20 +4,11 @@ env:
   variables:
     IMAGE_NAME: "devops-agent-demo"
     IMAGE_TAG: "latest"
-    FAIL_PUSH: "false"
 
 phases:
   pre_build:
     commands:
       - echo "Logging in to Docker Hub..."
-
-      # Intentional failure toggle
-      - |
-        if [ "$FAIL_PUSH" = "true" ]; then
-          echo "INTENTIONAL FAILURE ENABLED (wrong token)"
-          export DOCKERHUB_TOKEN="invalid-token"
-        fi
-
       - echo "$DOCKERHUB_TOKEN" | docker login -u "$DOCKERHUB_USERNAME" --password-stdin
       - export FULL_IMAGE="$DOCKERHUB_USERNAME/$IMAGE_NAME:$IMAGE_TAG"
 
