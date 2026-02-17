@@ -1,0 +1,47 @@
+version: 2.1
+
+jobs:
+  build-and-push:
+    docker:
+      - image: cimg/base:stable
+    steps:
+      - checkout
+      - setup_remote_docker
+
+      - run:
+          name: Docker Login
+          command: |
+            echo "$DOCKERHUB_TOKEN" | docker login -u "$DOCKERHUB_USERNAME" --password-stdin
+
+      - run:
+          name: Build Docker Image
+          command: |
+            docker build -t $DOCKERHUB_USERNAME/devops-agent-demo:latest .
+
+      - run:
+          name: Push Docker Image
+          command: |
+            docker push $DOCKERHUB_USERNAME/devops-agent-demo:latest
+
+      - run:
+          name: Notify DevOps Agent (only on failure)
+          when: on_fail
+          command: |
+            payload=$(cat <<JSON
+            {
+              "title": "CircleCI failure: ${CIRCLE_PROJECT_REPONAME}",
+              "description": "Job failed.\nRepo: ${CIRCLE_PROJECT_USERNAME}/${CIRCLE_PROJECT_REPONAME}\nBranch: ${CIRCLE_BRANCH}\nBuild: ${CIRCLE_BUILD_URL}",
+              "build_url": "${CIRCLE_BUILD_URL}"
+            }
+JSON
+            )
+
+            curl -X POST "$AWS_DEVOPS_LAMBDA_URL" \
+              -H "Content-Type: application/json" \
+              -H "x-circle-secret: $CIRCLE_SHARED_SECRET" \
+              -d "$payload"
+
+workflows:
+  build-workflow:
+    jobs:
+      - build-and-push
