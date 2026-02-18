@@ -1,25 +1,12 @@
 version: 2.1
 
-orbs:
-  aws-cli: circleci/aws-cli@4.1.3
-
 jobs:
   build-and-push:
     docker:
       - image: cimg/base:stable
-
-    environment:
-      LOG_GROUP: "/circleci/devops-agent-dockerhub-demo"
-      LOG_STREAM: "circleci-${CIRCLE_BUILD_NUM}"
-
     steps:
       - checkout
       - setup_remote_docker
-
-      # Assume AWS Role using OIDC
-      - aws-cli/setup:
-          role_arn: "${AWS_ROLE_ARN}"
-          region: "${AWS_REGION}"
 
       - run:
           name: Docker Login
@@ -27,37 +14,25 @@ jobs:
             echo "$DOCKERHUB_TOKEN" | docker login -u "$DOCKERHUB_USERNAME" --password-stdin
 
       - run:
-          name: Build Docker Image
+          name: Build Docker Image (expected to fail)
           command: |
-            docker build -t ${DOCKERHUB_USERNAME}/devops-agent-demo:latest .
+            # capture logs so we can send them if build fails
+            set -o pipefail
+            docker build -t ${DOCKERHUB_USERNAME}/devops-agent-demo:latest . 2>&1 | tee build.log
 
       - run:
           name: Push Docker Image
           command: |
             docker push ${DOCKERHUB_USERNAME}/devops-agent-demo:latest
 
-      # Push log to CloudWatch ALWAYS (even when build fails)
       - run:
-          name: Push build info to CloudWatch
-          when: always
-          command: |
-            TIMESTAMP=$(($(date +%s%N)/1000000))
-
-            aws logs create-log-stream \
-              --log-group-name "$LOG_GROUP" \
-              --log-stream-name "$LOG_STREAM" || true
-
-            aws logs put-log-events \
-              --log-group-name "$LOG_GROUP" \
-              --log-stream-name "$LOG_STREAM" \
-              --log-events timestamp=$TIMESTAMP,message="CircleCI build ${CIRCLE_BUILD_URL} finished. Job=${CIRCLE_JOB}. Branch=${CIRCLE_BRANCH}. Commit=${CIRCLE_SHA1}"
-
-      # Notify DevOps Agent only on failure
-      - run:
-          name: Notify DevOps Agent (only on failure)
+          name: Notify DevOps Agent (only on failure, include error logs)
           when: on_fail
           command: |
-            payload="{\"title\":\"CircleCI failure: ${CIRCLE_PROJECT_REPONAME}\",\"description\":\"Job failed. Repo: ${CIRCLE_PROJECT_USERNAME}/${CIRCLE_PROJECT_REPONAME} | Branch: ${CIRCLE_BRANCH} | Build: ${CIRCLE_BUILD_URL}\",\"build_url\":\"${CIRCLE_BUILD_URL}\"}"
+            # take last lines so payload doesn't become huge
+            LOG_SNIP=$(tail -n 120 build.log | sed 's/"/\\"/g')
+
+            payload="{\"title\":\"CircleCI failure: ${CIRCLE_PROJECT_REPONAME}\",\"description\":\"Job failed.\nRepo: ${CIRCLE_PROJECT_USERNAME}/${CIRCLE_PROJECT_REPONAME}\nBranch: ${CIRCLE_BRANCH}\nBuild: ${CIRCLE_BUILD_URL}\n\nLast logs:\n${LOG_SNIP}\",\"build_url\":\"${CIRCLE_BUILD_URL}\"}"
 
             curl -sS -X POST "$AWS_DEVOPS_LAMBDA_URL" \
               -H "Content-Type: application/json" \
