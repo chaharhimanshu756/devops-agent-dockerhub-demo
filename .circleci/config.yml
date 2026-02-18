@@ -10,24 +10,26 @@ jobs:
 
     steps:
       - checkout
-
-      # Required to run docker build
       - setup_remote_docker
 
-      # Run docker build (this will fail)
+      # Capture docker build failure but don't stop job yet
       - run:
-          name: Build Docker Image (Intentional Failure)
+          name: Build Docker (capture logs)
           command: |
-            docker build -t test-image .
+            set +e
+            docker build -t test-image . > build.log 2>&1
+            EXIT_CODE=$?
+            echo $EXIT_CODE > exit_code.txt
+            exit 0
 
-      # Assume role using OIDC
+      # Assume AWS role (OIDC)
       - aws-cli/setup:
           role_arn: ${AWS_ROLE_ARN}
           region: ${AWS_REGION}
 
+      # Push log to CloudWatch
       - run:
-          name: Send test log to CloudWatch
-          when: on_fail
+          name: Push log to CloudWatch
           command: |
             LOG_GROUP="/circleci/devops-agent-dockerhub-demo"
             LOG_STREAM="circleci-${CIRCLE_BUILD_NUM}"
@@ -37,10 +39,34 @@ jobs:
               --log-group-name "$LOG_GROUP" \
               --log-stream-name "$LOG_STREAM" || true
 
+            LOG_SNIP=$(tail -n 50 build.log | sed 's/"/\\"/g')
+
             aws logs put-log-events \
               --log-group-name "$LOG_GROUP" \
               --log-stream-name "$LOG_STREAM" \
-              --log-events timestamp=$TIMESTAMP,message="Docker build failed in ${CIRCLE_BUILD_URL}"
+              --log-events timestamp=$TIMESTAMP,message="$LOG_SNIP"
+
+      # Trigger DevOps Agent via Lambda
+      - run:
+          name: Trigger DevOps Agent
+          command: |
+            LOG_SNIP=$(tail -n 50 build.log | sed 's/"/\\"/g')
+
+            payload="{\"title\":\"CircleCI Docker Failure\",\"description\":\"Build: ${CIRCLE_BUILD_URL}\n\n${LOG_SNIP}\"}"
+
+            curl -X POST "$AWS_DEVOPS_LAMBDA_URL" \
+              -H "Content-Type: application/json" \
+              -H "x-circle-secret: $CIRCLE_SHARED_SECRET" \
+              -d "$payload"
+
+      # Now actually fail job
+      - run:
+          name: Fail Job If Docker Failed
+          command: |
+            EXIT_CODE=$(cat exit_code.txt)
+            if [ "$EXIT_CODE" -ne 0 ]; then
+              exit 1
+            fi
 
 workflows:
   simple-workflow:
