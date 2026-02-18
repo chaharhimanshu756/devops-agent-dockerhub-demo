@@ -1,56 +1,53 @@
 version: 2.1
 
-orbs:
-  aws-cli: circleci/aws-cli@5.1.1
-
 jobs:
-  build-and-devops-agent:
+  build-and-log:
     docker:
       - image: cimg/base:stable
 
     environment:
-      LOG_GROUP: /circleci/devops-agent-dockerhub-demo
+      LOG_GROUP: "/circleci/devops-agent-dockerhub-demo"
+      LOG_STREAM: "circleci-${CIRCLE_BUILD_NUM}"
 
     steps:
       - checkout
 
-      # If earlier it worked, keep your existing role+region flow
-      - aws-cli/setup:
-          region: AWS_REGION
-          role_arn: AWS_ROLE_ARN
+      - run:
+          name: Install AWS CLI
+          command: |
+            sudo apt-get update -y
+            sudo apt-get install -y awscli
 
       - run:
-          name: Build (prints CloudWatch markers)
+          name: Configure AWS Credentials
           command: |
-            set -euo pipefail
-
-            # These lines MUST appear in CloudWatch logs (your existing log shipping will carry them)
-            echo "CW_MARKER_START build=${CIRCLE_BUILD_NUM} workflow=${CIRCLE_WORKFLOW_ID} job=${CIRCLE_JOB} repo=${CIRCLE_PROJECT_REPONAME} sha=${CIRCLE_SHA1}"
-            
-            # YOUR REAL BUILD COMMAND(S)
-            ./build.sh
-
-            echo "CW_MARKER_END build=${CIRCLE_BUILD_NUM} workflow=${CIRCLE_WORKFLOW_ID} job=${CIRCLE_JOB} status=success"
+            aws configure set aws_access_key_id $AWS_ACCESS_KEY_ID
+            aws configure set aws_secret_access_key $AWS_SECRET_ACCESS_KEY
+            aws configure set default.region $AWS_REGION
 
       - run:
-          name: Invoke Lambda (end) with identifiers
-          when: always
+          name: Push Test Log To CloudWatch
           command: |
-            set +e
+            aws logs create-log-group \
+              --log-group-name "$LOG_GROUP" || true
 
-            # If build failed earlier, this step still runs. Tell Lambda "unknown" unless you compute it.
-            STATUS="unknown"
+            aws logs create-log-stream \
+              --log-group-name "$LOG_GROUP" \
+              --log-stream-name "$LOG_STREAM" || true
 
-            # Minimal JSON payload without jq/heredoc (safe)
-            PAYLOAD="{\"logGroup\":\"${LOG_GROUP}\",\"buildNum\":\"${CIRCLE_BUILD_NUM}\",\"workflowId\":\"${CIRCLE_WORKFLOW_ID}\",\"job\":\"${CIRCLE_JOB}\",\"repo\":\"${CIRCLE_PROJECT_REPONAME}\",\"branch\":\"${CIRCLE_BRANCH}\",\"sha1\":\"${CIRCLE_SHA1}\",\"status\":\"${STATUS}\"}"
+            TIMESTAMP=$(($(date +%s%N)/1000000))
 
-            curl -sS -X POST "${AWS_DEVOPS_LAMBDA_URL}" \
-              -H "Content-Type: application/json" \
-              -H "x-circleci-signature: ${CIRCLE_SHARED_SECRET}" \
-              -d "${PAYLOAD}" || true
+            aws logs put-log-events \
+              --log-group-name "$LOG_GROUP" \
+              --log-stream-name "$LOG_STREAM" \
+              --log-events timestamp=$TIMESTAMP,message="CircleCI build ${CIRCLE_BUILD_URL} executed successfully"
+
+      - run:
+          name: Docker Login (just to test creds)
+          command: |
+            echo "$DOCKERHUB_TOKEN" | docker login -u "$DOCKERHUB_USERNAME" --password-stdin
 
 workflows:
-  version: 2
-  devops-agent-dockerhub-demo:
+  simple-workflow:
     jobs:
-      - build-and-devops-agent
+      - build-and-log
