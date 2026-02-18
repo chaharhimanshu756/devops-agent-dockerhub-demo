@@ -10,9 +10,22 @@ jobs:
 
     steps:
       - checkout
+
       - setup_remote_docker
 
-      # Capture docker build failure but don't stop job yet
+      # 🔐 Assume AWS Role using OIDC
+      - aws-cli/setup:
+          role_arn: ${AWS_ROLE_ARN}
+          region: ${AWS_REGION}
+
+      # Install jq (needed for safe JSON conversion)
+      - run:
+          name: Install jq
+          command: |
+            sudo apt-get update
+            sudo apt-get install -y jq
+
+      # 🐳 Build Docker (capture logs, allow failure)
       - run:
           name: Build Docker (capture logs)
           command: |
@@ -22,12 +35,7 @@ jobs:
             echo $EXIT_CODE > exit_code.txt
             exit 0
 
-      # Assume AWS role (OIDC)
-      - aws-cli/setup:
-          role_arn: ${AWS_ROLE_ARN}
-          region: ${AWS_REGION}
-
-      # Push log to CloudWatch
+      # 📤 Push logs to CloudWatch (always runs)
       - run:
           name: Push log to CloudWatch
           command: |
@@ -39,32 +47,28 @@ jobs:
               --log-group-name "$LOG_GROUP" \
               --log-stream-name "$LOG_STREAM" || true
 
-            LOG_SNIP=$(tail -n 50 build.log | sed 's/"/\\"/g')
+            LOG_SNIP=$(tail -n 50 build.log)
 
             aws logs put-log-events \
               --log-group-name "$LOG_GROUP" \
               --log-stream-name "$LOG_STREAM" \
-              --log-events timestamp=$TIMESTAMP,message="$LOG_SNIP"
+              --log-events "[{\"timestamp\":$TIMESTAMP,\"message\":$(printf '%s' "$LOG_SNIP" | jq -Rs .)}]"
 
-      # Trigger DevOps Agent via Lambda
+      # 🚨 Trigger DevOps Agent if failed
       - run:
-          name: Trigger DevOps Agent
-          command: |
-            LOG_SNIP=$(tail -n 50 build.log | sed 's/"/\\"/g')
-
-            payload="{\"title\":\"CircleCI Docker Failure\",\"description\":\"Build: ${CIRCLE_BUILD_URL}\n\n${LOG_SNIP}\"}"
-
-            curl -X POST "$AWS_DEVOPS_LAMBDA_URL" \
-              -H "Content-Type: application/json" \
-              -H "x-circle-secret: $CIRCLE_SHARED_SECRET" \
-              -d "$payload"
-
-      # Now actually fail job
-      - run:
-          name: Fail Job If Docker Failed
+          name: Trigger DevOps Agent (only on failure)
           command: |
             EXIT_CODE=$(cat exit_code.txt)
             if [ "$EXIT_CODE" -ne 0 ]; then
+              echo "Build failed — notifying DevOps Agent"
+
+              payload="{\"title\":\"CircleCI failure: ${CIRCLE_PROJECT_REPONAME}\",\"description\":\"Repo: ${CIRCLE_PROJECT_USERNAME}/${CIRCLE_PROJECT_REPONAME}\nBranch: ${CIRCLE_BRANCH}\nBuild: ${CIRCLE_BUILD_URL}\"}"
+
+              curl -X POST "$AWS_DEVOPS_LAMBDA_URL" \
+                -H "Content-Type: application/json" \
+                -H "x-circle-secret: $CIRCLE_SHARED_SECRET" \
+                -d "$payload"
+
               exit 1
             fi
 
