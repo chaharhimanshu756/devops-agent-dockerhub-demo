@@ -1,58 +1,75 @@
 version: 2.1
 
+orbs:
+  aws-cli: circleci/aws-cli@5.1.1
+
 jobs:
-  build-and-push:
+  build-and-send:
     docker:
       - image: cimg/base:stable
-
+    environment:
+      LOG_GROUP: /circleci/devops-agent-dockerhub-demo
+      LOG_FILE: /tmp/build.log
     steps:
       - checkout
-      - setup_remote_docker
+
+      # Auth to AWS via role (use your preferred method; this orb supports role_arn)
+      - aws-cli/setup:
+          region: AWS_REGION
+          role_arn: AWS_ROLE_ARN
 
       - run:
-          name: Docker Login
+          name: Start CloudWatch log shipper
           command: |
-            echo "$DOCKERHUB_TOKEN" | docker login -u "$DOCKERHUB_USERNAME" --password-stdin
+            set -e
+            export LOG_STREAM="circleci/${CIRCLE_PROJECT_REPONAME}/${CIRCLE_WORKFLOW_ID}/${CIRCLE_JOB}/${CIRCLE_BUILD_NUM}"
+            echo "LOG_STREAM=${LOG_STREAM}"
+            python3 -m pip install --user boto3
+            # start shipper in background
+            (python3 .circleci/cw_shipper.py &) 
+            echo $! > /tmp/cw_shipper.pid
 
       - run:
-          name: Build Docker Image (capture logs)
+          name: Build (tee output to file for shipping)
           command: |
-            set +e
-            docker build -t ${DOCKERHUB_USERNAME}/devops-agent-demo:latest . > build.log 2>&1
-            EXIT_CODE=$?
-            echo $EXIT_CODE > exit_code.txt
-            exit 0
+            set -euo pipefail
+            # Example build command; replace with yours
+            ./your_build_command 2>&1 | tee -a "${LOG_FILE}"
 
       - run:
-          name: Fail job if docker failed
+          name: Stop shipper + Invoke Lambda with log metadata
+          when: always
           command: |
-            EXIT_CODE=$(cat exit_code.txt)
-            if [ "$EXIT_CODE" -ne 0 ]; then
-              echo "Build failed"
-              exit 1
-            fi
+            set -e
+            export LOG_STREAM="circleci/${CIRCLE_PROJECT_REPONAME}/${CIRCLE_WORKFLOW_ID}/${CIRCLE_JOB}/${CIRCLE_BUILD_NUM}"
 
-      - run:
-          name: Notify DevOps Agent (only on failure)
-          when: on_fail
-          command: |
-            echo "Sending logs to DevOps Agent..."
+            # tell shipper to stop cleanly
+            echo "__CW_SHIPPER_STOP__" >> "${LOG_FILE}"
+            sleep 2
 
-            LOG_SNIP=$(tail -n 150 build.log | \
-              sed -e 's/\\/\\\\/g' \
-                  -e 's/"/\\"/g' \
-                  -e ':a;N;$!ba;s/\n/\\n/g')
+            # invoke Lambda (your endpoint). Include status & metadata.
+            STATUS="success"
+            if [ "${CIRCLE_JOB}" = "" ]; then STATUS="unknown"; fi
 
-            DESC="Repo: ${CIRCLE_PROJECT_USERNAME}/${CIRCLE_PROJECT_REPONAME}\\nBranch: ${CIRCLE_BRANCH}\\nBuild: ${CIRCLE_BUILD_URL}\\n\\nError Logs (last 150 lines):\\n${LOG_SNIP}"
+            PAYLOAD=$(cat <<EOF
+            {
+              "logGroup": "${LOG_GROUP}",
+              "logStream": "${LOG_STREAM}",
+              "buildNum": "${CIRCLE_BUILD_NUM}",
+              "workflowId": "${CIRCLE_WORKFLOW_ID}",
+              "job": "${CIRCLE_JOB}",
+              "repo": "${CIRCLE_PROJECT_REPONAME}",
+              "branch": "${CIRCLE_BRANCH}",
+              "sha1": "${CIRCLE_SHA1}",
+              "status": "${STATUS}"
+            }
+EOF
+            )
 
-            payload="{\"title\":\"CircleCI failure: ${CIRCLE_PROJECT_REPONAME}\",\"description\":\"${DESC}\"}"
+            echo "Invoking Lambda with payload:"
+            echo "${PAYLOAD}"
 
-            curl -sS -X POST "$AWS_DEVOPS_LAMBDA_URL" \
+            curl -sS -X POST "${AWS_DEVOPS_LAMBDA_URL}" \
               -H "Content-Type: application/json" \
-              -H "x-circle-secret: $CIRCLE_SHARED_SECRET" \
-              -d "$payload"
-
-workflows:
-  build-workflow:
-    jobs:
-      - build-and-push
+              -H "x-circleci-signature: ${CIRCLE_SHARED_SECRET}" \
+              -d "${PAYLOAD}"
