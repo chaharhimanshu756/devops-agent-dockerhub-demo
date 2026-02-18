@@ -15,171 +15,48 @@ jobs:
     steps:
       - checkout
 
-      # 1) Configure AWS using OIDC -> Assume Role
       - aws-cli/setup:
           region: AWS_REGION
           role_arn: AWS_ROLE_ARN
 
-      # 2) Install jq (for safe JSON payload creation)
       - run:
           name: Install jq
           command: |
             sudo apt-get update
             sudo apt-get install -y jq
 
-      # 3) Write the CloudWatch shipper script into the job workspace
       - run:
-          name: Create CloudWatch log shipper
-          command: |
-            cat > /tmp/cw_shipper.py <<'PY'
-            import os, time
-            import boto3
-            from botocore.exceptions import ClientError
-
-            LOG_GROUP = os.environ["LOG_GROUP"]
-            LOG_STREAM = os.environ["LOG_STREAM"]
-            LOG_FILE = os.environ["LOG_FILE"]
-            REGION = os.environ.get("AWS_REGION")
-
-            client = boto3.client("logs", region_name=REGION)
-
-            def ensure_group_stream():
-                try:
-                    client.create_log_group(logGroupName=LOG_GROUP)
-                except ClientError as e:
-                    if e.response["Error"]["Code"] != "ResourceAlreadyExistsException":
-                        raise
-
-                try:
-                    client.create_log_stream(logGroupName=LOG_GROUP, logStreamName=LOG_STREAM)
-                except ClientError as e:
-                    if e.response["Error"]["Code"] != "ResourceAlreadyExistsException":
-                        raise
-
-            def get_sequence_token():
-                resp = client.describe_log_streams(
-                    logGroupName=LOG_GROUP,
-                    logStreamNamePrefix=LOG_STREAM,
-                    limit=1
-                )
-                streams = resp.get("logStreams", [])
-                if not streams:
-                    return None
-                return streams[0].get("uploadSequenceToken")
-
-            def put_events(events, token):
-                kwargs = {
-                    "logGroupName": LOG_GROUP,
-                    "logStreamName": LOG_STREAM,
-                    "logEvents": events,
-                }
-                if token:
-                    kwargs["sequenceToken"] = token
-                resp = client.put_log_events(**kwargs)
-                return resp.get("nextSequenceToken")
-
-            def flush(buf, token):
-                buf.sort(key=lambda e: e["timestamp"])
-                try:
-                    return put_events(buf, token)
-                except ClientError as e:
-                    code = e.response["Error"]["Code"]
-                    if code in ("InvalidSequenceTokenException", "DataAlreadyAcceptedException"):
-                        new_token = get_sequence_token()
-                        return put_events(buf, new_token)
-                    raise
-
-            def main():
-                ensure_group_stream()
-
-                # Tail from end so we only ship this job's output
-                with open(LOG_FILE, "r", encoding="utf-8", errors="replace") as f:
-                    f.seek(0, 2)
-
-                    token = get_sequence_token()
-                    buf = []
-                    buf_bytes = 0
-                    last_flush = time.time()
-
-                    while True:
-                        line = f.readline()
-                        if not line:
-                            now = time.time()
-                            if buf and (now - last_flush) >= 1.5:
-                                token = flush(buf, token)
-                                buf, buf_bytes = [], 0
-                                last_flush = now
-                            time.sleep(0.2)
-                            continue
-
-                        if line.strip() == "__CW_SHIPPER_STOP__":
-                            break
-
-                        event = {"timestamp": int(time.time() * 1000), "message": line}
-                        buf.append(event)
-                        buf_bytes += len(line.encode("utf-8", "ignore"))
-
-                        # Stay under 1MB/req
-                        if buf_bytes >= 800_000 or len(buf) >= 500:
-                            token = flush(buf, token)
-                            buf, buf_bytes = [], 0
-                            last_flush = time.time()
-
-                    if buf:
-                        flush(buf, token)
-
-            if __name__ == "__main__":
-                main()
-            PY
-
-      # 4) Start shipper in background
-      - run:
-          name: Start CloudWatch streaming
+          name: Start CloudWatch log streaming
           command: |
             set -e
-            export LOG_STREAM="circleci/${CIRCLE_PROJECT_REPONAME}/${CIRCLE_WORKFLOW_ID}/${CIRCLE_JOB}/${CIRCLE_BUILD_NUM}"
-            echo "LOG_GROUP=${LOG_GROUP}"
-            echo "LOG_STREAM=${LOG_STREAM}"
-            echo "Logging to file: ${LOG_FILE}"
-
-            # Ensure file exists
             touch "${LOG_FILE}"
-
-            # boto3 already present in python image; install if needed
+            export LOG_STREAM="circleci/${CIRCLE_PROJECT_REPONAME}/${CIRCLE_WORKFLOW_ID}/${CIRCLE_JOB}/${CIRCLE_BUILD_NUM}"
             python -c "import boto3" || pip install --user boto3
-
-            # Start shipper
-            python /tmp/cw_shipper.py &
+            python .circleci/cw_shipper.py &
             echo $! > /tmp/cw_shipper.pid
 
-      # 5) Your build step (IMPORTANT: pipe output to tee)
       - run:
-          name: Build (example)
+          name: Build (capture status)
           command: |
-            set -euo pipefail
-            # Replace this with your real build commands
-            echo "Starting build..."
+            set +e
             ./build.sh 2>&1 | tee -a "${LOG_FILE}"
+            echo $? > /tmp/build_exit_code
+            exit 0
 
-      # 6) Stop shipper + invoke Lambda (always)
       - run:
-          name: Invoke DevOps Lambda with CloudWatch log details
+          name: Stop shipper + invoke Lambda (always)
           when: always
           command: |
             set +e
-
             export LOG_STREAM="circleci/${CIRCLE_PROJECT_REPONAME}/${CIRCLE_WORKFLOW_ID}/${CIRCLE_JOB}/${CIRCLE_BUILD_NUM}"
 
-            # Mark job status in a simple way:
-            # CircleCI doesn't expose exit code of previous step here,
-            # but we still call lambda always and pass "unknown" unless you set it explicitly.
-            STATUS="unknown"
-
-            echo "Stopping shipper..."
-            echo "__CW_SHIPPER_STOP__" >> "${LOG_FILE}"
+            # stop shipper cleanly
+            echo "__CW_STOP__" >> "${LOG_FILE}"
             sleep 2
 
-            # Build payload safely (no heredoc)
+            EXIT_CODE=$(cat /tmp/build_exit_code 2>/dev/null || echo 1)
+            if [ "$EXIT_CODE" = "0" ]; then STATUS="success"; else STATUS="failed"; fi
+
             PAYLOAD=$(jq -n \
               --arg logGroup "${LOG_GROUP}" \
               --arg logStream "${LOG_STREAM}" \
@@ -202,10 +79,6 @@ jobs:
                 status: $status
               }')
 
-            echo "Calling Lambda URL: ${AWS_DEVOPS_LAMBDA_URL}"
-            echo "Payload: ${PAYLOAD}"
-
-            # If your Lambda URL expects a shared secret header
             curl -sS -X POST "${AWS_DEVOPS_LAMBDA_URL}" \
               -H "Content-Type: application/json" \
               -H "x-circleci-signature: ${CIRCLE_SHARED_SECRET}" \
