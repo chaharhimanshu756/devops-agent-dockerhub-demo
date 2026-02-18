@@ -11,18 +11,23 @@ jobs:
     steps:
       - checkout
 
+      # Required to run docker build
+      - setup_remote_docker
+
+      # Run docker build (this will fail)
+      - run:
+          name: Build Docker Image (Intentional Failure)
+          command: |
+            docker build -t test-image .
+
       # Assume role using OIDC
       - aws-cli/setup:
           role_arn: ${AWS_ROLE_ARN}
           region: ${AWS_REGION}
 
       - run:
-          name: Test AWS Access
-          command: |
-            aws sts get-caller-identity
-
-      - run:
           name: Send test log to CloudWatch
+          when: on_fail
           command: |
             LOG_GROUP="/circleci/devops-agent-dockerhub-demo"
             LOG_STREAM="circleci-${CIRCLE_BUILD_NUM}"
@@ -35,7 +40,7 @@ jobs:
             aws logs put-log-events \
               --log-group-name "$LOG_GROUP" \
               --log-stream-name "$LOG_STREAM" \
-              --log-events timestamp=$TIMESTAMP,message="CircleCI build ${CIRCLE_BUILD_URL}"
+              --log-events timestamp=$TIMESTAMP,message="Docker build failed in ${CIRCLE_BUILD_URL}"
 
 workflows:
   simple-workflow:
