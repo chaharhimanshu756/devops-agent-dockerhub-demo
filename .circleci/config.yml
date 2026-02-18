@@ -14,27 +14,34 @@ jobs:
             echo "$DOCKERHUB_TOKEN" | docker login -u "$DOCKERHUB_USERNAME" --password-stdin
 
       - run:
-          name: Build Docker Image (expected to fail)
+          name: Build Docker Image (capture logs)
           command: |
-            # capture logs so we can send them if build fails
-            set -o pipefail
-            docker build -t ${DOCKERHUB_USERNAME}/devops-agent-demo:latest . 2>&1 | tee build.log
+            set +e
+            docker build -t ${DOCKERHUB_USERNAME}/devops-agent-demo:latest . > build.log 2>&1
+            EXIT_CODE=$?
+            echo "Docker exit code: $EXIT_CODE"
+            echo $EXIT_CODE > exit_code.txt
+            exit 0
 
       - run:
-          name: Push Docker Image
+          name: Fail job if docker failed
           command: |
-            docker push ${DOCKERHUB_USERNAME}/devops-agent-demo:latest
+            EXIT_CODE=$(cat exit_code.txt)
+            if [ "$EXIT_CODE" -ne 0 ]; then
+              echo "Build failed"
+              exit 1
+            fi
 
       - run:
-          name: Notify DevOps Agent (only on failure, include error logs)
+          name: Notify DevOps Agent (only on failure)
           when: on_fail
           command: |
-            # take last lines so payload doesn't become huge
-            LOG_SNIP=$(tail -n 120 build.log | sed 's/"/\\"/g')
+            echo "Sending logs to DevOps Agent..."
+            LOG_SNIP=$(tail -n 150 build.log | sed 's/"/\\"/g')
 
-            payload="{\"title\":\"CircleCI failure: ${CIRCLE_PROJECT_REPONAME}\",\"description\":\"Job failed.\nRepo: ${CIRCLE_PROJECT_USERNAME}/${CIRCLE_PROJECT_REPONAME}\nBranch: ${CIRCLE_BRANCH}\nBuild: ${CIRCLE_BUILD_URL}\n\nLast logs:\n${LOG_SNIP}\",\"build_url\":\"${CIRCLE_BUILD_URL}\"}"
+            payload="{\"title\":\"CircleCI failure: ${CIRCLE_PROJECT_REPONAME}\",\"description\":\"Repo: ${CIRCLE_PROJECT_USERNAME}/${CIRCLE_PROJECT_REPONAME}\nBranch: ${CIRCLE_BRANCH}\nBuild: ${CIRCLE_BUILD_URL}\n\nError Logs:\n${LOG_SNIP}\"}"
 
-            curl -sS -X POST "$AWS_DEVOPS_LAMBDA_URL" \
+            curl -X POST "$AWS_DEVOPS_LAMBDA_URL" \
               -H "Content-Type: application/json" \
               -H "x-circle-secret: $CIRCLE_SHARED_SECRET" \
               -d "$payload"
