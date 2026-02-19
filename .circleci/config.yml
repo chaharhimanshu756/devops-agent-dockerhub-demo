@@ -1,4 +1,3 @@
-# .circleci/config.yml
 version: 2.1
 
 orbs:
@@ -10,14 +9,13 @@ jobs:
       - image: cimg/base:stable
 
     environment:
-      # Centralize these so Lambda can always find logs
       LOG_GROUP: "/circleci/devops-agent-dockerhub-demo"
 
     steps:
       - checkout
+
       - setup_remote_docker
 
-      # Assume AWS Role using OIDC
       - aws-cli/setup:
           role_arn: ${AWS_ROLE_ARN}
           region: ${AWS_REGION}
@@ -28,7 +26,6 @@ jobs:
             sudo apt-get update
             sudo apt-get install -y jq
 
-      # Build Docker (capture logs, allow pipeline to continue)
       - run:
           name: Build Docker (capture logs)
           command: |
@@ -36,10 +33,8 @@ jobs:
             docker build -t test-image . > build.log 2>&1
             EXIT_CODE=$?
             echo "$EXIT_CODE" > exit_code.txt
-            # Always continue so we can ship logs + notify on failure
             exit 0
 
-      # Push logs to CloudWatch (always runs)
       - run:
           name: Push logs to CloudWatch
           command: |
@@ -48,7 +43,6 @@ jobs:
             LOG_STREAM="circleci-${CIRCLE_BUILD_NUM}"
             TIMESTAMP_MS=$(($(date +%s%N)/1000000))
 
-            # Add context + tail of build log
             {
               echo "Build URL: ${CIRCLE_BUILD_URL}"
               echo "Repo: ${CIRCLE_PROJECT_USERNAME}/${CIRCLE_PROJECT_REPONAME}"
@@ -60,17 +54,14 @@ jobs:
               tail -n 200 build.log || true
             } > cw_message.log
 
-            # Ensure log group exists (safe if it already exists)
             aws logs create-log-group --log-group-name "${LOG_GROUP}" 2>/dev/null || true
 
-            # Ensure stream exists
             aws logs create-log-stream \
               --log-group-name "${LOG_GROUP}" \
               --log-stream-name "${LOG_STREAM}" 2>/dev/null || true
 
             MESSAGE_JSON=$(jq -Rs . < cw_message.log)
 
-            # Sequence token handling (prevents InvalidSequenceToken errors)
             TOKEN=$(aws logs describe-log-streams \
               --log-group-name "${LOG_GROUP}" \
               --log-stream-name-prefix "${LOG_STREAM}" \
@@ -90,7 +81,6 @@ jobs:
                 --sequence-token "${TOKEN}"
             fi
 
-      # Trigger DevOps Agent if failed (only on failure)
       - run:
           name: Trigger DevOps Agent (only on failure)
           command: |
@@ -102,7 +92,6 @@ jobs:
 
               LOG_STREAM="circleci-${CIRCLE_BUILD_NUM}"
 
-              # Build a rich payload including CloudWatch pointers
               payload="$(cat <<EOF
 {
   "title": "CircleCI failure: ${CIRCLE_PROJECT_REPONAME}",
@@ -122,7 +111,6 @@ EOF
                 -H "x-circle-secret: ${CIRCLE_SHARED_SECRET}" \
                 -d "${payload}"
 
-              # Mark job as failed
               exit 1
             fi
 
