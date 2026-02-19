@@ -13,7 +13,6 @@ jobs:
 
     steps:
       - checkout
-
       - setup_remote_docker
 
       - aws-cli/setup:
@@ -36,7 +35,7 @@ jobs:
             exit 0
 
       - run:
-          name: Push logs to CloudWatch
+          name: Push logs to CloudWatch (always)
           command: |
             set -euo pipefail
 
@@ -88,23 +87,24 @@ jobs:
             EXIT_CODE=$(cat exit_code.txt)
 
             if [ "${EXIT_CODE}" -ne 0 ]; then
-              echo "Build failed — notifying DevOps Agent"
-
               LOG_STREAM="circleci-${CIRCLE_BUILD_NUM}"
 
-              payload="$(cat <<EOF
-{
-  "title": "CircleCI failure: ${CIRCLE_PROJECT_REPONAME}",
-  "description": "Repo: ${CIRCLE_PROJECT_USERNAME}/${CIRCLE_PROJECT_REPONAME}\nBranch: ${CIRCLE_BRANCH}\nBuild: ${CIRCLE_BUILD_URL}\nCommit: ${CIRCLE_SHA1}\nExitCode: ${EXIT_CODE}",
-  "build_num": ${CIRCLE_BUILD_NUM},
-  "aws_region": "${AWS_REGION}",
-  "cloudwatch": {
-    "log_group": "${LOG_GROUP}",
-    "log_stream": "${LOG_STREAM}"
-  }
-}
-EOF
-)"
+              payload=$(jq -n \
+                --arg title "CircleCI failure: ${CIRCLE_PROJECT_REPONAME}" \
+                --arg description "Repo: ${CIRCLE_PROJECT_USERNAME}/${CIRCLE_PROJECT_REPONAME}\nBranch: ${CIRCLE_BRANCH}\nBuild: ${CIRCLE_BUILD_URL}\nCommit: ${CIRCLE_SHA1}\nExitCode: ${EXIT_CODE}" \
+                --arg aws_region "${AWS_REGION}" \
+                --arg log_group "${LOG_GROUP}" \
+                --arg log_stream "${LOG_STREAM}" \
+                --arg build_url "${CIRCLE_BUILD_URL}" \
+                --argjson build_num "${CIRCLE_BUILD_NUM}" \
+                '{
+                  title: $title,
+                  description: $description,
+                  build_url: $build_url,
+                  build_num: $build_num,
+                  aws_region: $aws_region,
+                  cloudwatch: { log_group: $log_group, log_stream: $log_stream }
+                }')
 
               curl -sS -X POST "${AWS_DEVOPS_LAMBDA_URL}" \
                 -H "Content-Type: application/json" \
