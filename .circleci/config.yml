@@ -4,16 +4,13 @@ orbs:
   aws-cli: circleci/aws-cli@4.1.3
 
 jobs:
-  build-and-log:
+  dockerhub-auth-fail-test:
     docker:
       - image: cimg/base:stable
-
     environment:
       LOG_GROUP: "/circleci/devops-agent-dockerhub-demo"
-
     steps:
       - checkout
-      - setup_remote_docker
 
       - aws-cli/setup:
           role_arn: ${AWS_ROLE_ARN}
@@ -25,11 +22,18 @@ jobs:
             sudo apt-get update
             sudo apt-get install -y jq
 
+      - setup_remote_docker
+
       - run:
-          name: Build Docker (capture logs)
+          name: DockerHub login (intentional failure, capture logs)
           command: |
             set +e
-            docker build -t test-image . > build.log 2>&1
+
+            # Break credentials ONLY for this run
+            export DOCKERHUB_USERNAME="wrong-user"
+            # export DOCKERHUB_TOKEN="invalid-token"
+
+            echo "$DOCKERHUB_TOKEN" | docker login -u "$DOCKERHUB_USERNAME" --password-stdin > build.log 2>&1
             EXIT_CODE=$?
             echo "$EXIT_CODE" > exit_code.txt
             exit 0
@@ -38,7 +42,6 @@ jobs:
           name: Push logs to CloudWatch (always)
           command: |
             set -euo pipefail
-
             LOG_STREAM="circleci-${CIRCLE_BUILD_NUM}"
             TIMESTAMP_MS=$(($(date +%s%N)/1000000))
 
@@ -54,10 +57,7 @@ jobs:
             } > cw_message.log
 
             aws logs create-log-group --log-group-name "${LOG_GROUP}" 2>/dev/null || true
-
-            aws logs create-log-stream \
-              --log-group-name "${LOG_GROUP}" \
-              --log-stream-name "${LOG_STREAM}" 2>/dev/null || true
+            aws logs create-log-stream --log-group-name "${LOG_GROUP}" --log-stream-name "${LOG_STREAM}" 2>/dev/null || true
 
             MESSAGE_JSON=$(jq -Rs . < cw_message.log)
 
@@ -90,18 +90,14 @@ jobs:
               LOG_STREAM="circleci-${CIRCLE_BUILD_NUM}"
 
               payload=$(jq -n \
-                --arg title "CircleCI failure: ${CIRCLE_PROJECT_REPONAME}" \
-                --arg description "Repo: ${CIRCLE_PROJECT_USERNAME}/${CIRCLE_PROJECT_REPONAME}\nBranch: ${CIRCLE_BRANCH}\nBuild: ${CIRCLE_BUILD_URL}\nCommit: ${CIRCLE_SHA1}\nExitCode: ${EXIT_CODE}" \
+                --arg title "CircleCI DockerHub auth failure: ${CIRCLE_PROJECT_REPONAME}" \
+                --arg description "DockerHub login failed (intentional test).\nRepo: ${CIRCLE_PROJECT_USERNAME}/${CIRCLE_PROJECT_REPONAME}\nBranch: ${CIRCLE_BRANCH}\nBuild: ${CIRCLE_BUILD_URL}\nCommit: ${CIRCLE_SHA1}\nExitCode: ${EXIT_CODE}" \
                 --arg aws_region "${AWS_REGION}" \
                 --arg log_group "${LOG_GROUP}" \
                 --arg log_stream "${LOG_STREAM}" \
-                --arg build_url "${CIRCLE_BUILD_URL}" \
-                --argjson build_num "${CIRCLE_BUILD_NUM}" \
                 '{
                   title: $title,
                   description: $description,
-                  build_url: $build_url,
-                  build_num: $build_num,
                   aws_region: $aws_region,
                   cloudwatch: { log_group: $log_group, log_stream: $log_stream }
                 }')
@@ -115,6 +111,6 @@ jobs:
             fi
 
 workflows:
-  simple-workflow:
+  dockerhub-auth-fail-workflow:
     jobs:
-      - build-and-log
+      - dockerhub-auth-fail-test
