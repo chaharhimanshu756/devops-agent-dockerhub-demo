@@ -1,2 +1,2 @@
-import totally_not_a_real_module  # this will fail
+import totally_not_a_real_module  
 print("hello")
